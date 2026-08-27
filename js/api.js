@@ -1,156 +1,126 @@
 /**
  * api.js
- * Stands in for the real Extingo device API. In production this
- * module would talk to the panel's local network endpoint or
- * MQTT bridge; here it simulates a plausible sensor feed so the
- * rest of the dashboard (history.js, dashboard.js) can be built
- * and demoed against a realistic shape of data.
+ * Polls a live Extingo backend instead of simulating one. This is
+ * the shared contract other Extingo front ends (including Site B)
+ * must also speak, so keep the event names and response shape
+ * exactly as documented here if this file is ported elsewhere.
  *
- * Public surface: ExtingoAPI.subscribe(fn), .getStatus(reading),
- * .setSpray(bool), .setMCB(bool), .getOverrideState()
+ * Endpoint:   GET {serverUrl}/api/data
+ * Response:   { telemetry, alert, status, command }
+ *
+ * Events (dispatched on `window`):
+ *   'extingo:data'    detail = the parsed { telemetry, alert, status, command } payload
+ *   'extingo:offline' detail = { error, attempt, nextRetryMs }
+ *
+ * Public API: window.ExtingoAPI.startPolling(serverUrl) -> { stop() }
  */
 (function (global) {
   'use strict';
 
-  var POLL_INTERVAL_MS = 2000;
+  var BASE_INTERVAL_MS = 2500;   // steady-state poll cadence
+  var MAX_BACKOFF_MS = 10000;    // ceiling for retry backoff
+  var REQUEST_TIMEOUT_MS = 8000; // give up on a single request after this long
 
-  var THRESHOLDS = {
-    smokeWarn: 220,
-    smokeAlert: 400,
-    heatWarn: 45,
-    heatAlert: 60
-  };
-
-  var overrideState = {
-    spray: false,
-    mcb: true // main breaker on by default
-  };
-
-  var state = {
-    smoke: 90,
-    heat: 24,
-    flameChance: 0.02,
-    motionChance: 0.12,
-    driftDirection: 1
-  };
-
-  var listeners = [];
-  var timer = null;
-
-  function clamp(v, min, max) {
-    return Math.max(min, Math.min(max, v));
+  function dispatch(eventName, detail) {
+    global.dispatchEvent(new CustomEvent(eventName, { detail: detail }));
   }
 
-  function randomWalk(value, step, min, max) {
-    var delta = (Math.random() - 0.48) * step;
-    return clamp(value + delta, min, max);
+  /** Basic shape check so a malformed backend response fails loudly
+   *  (as an offline/error event) instead of reaching the UI half-formed. */
+  function isValidPayload(payload) {
+    return !!payload && typeof payload === 'object' &&
+      'telemetry' in payload &&
+      'alert' in payload &&
+      'status' in payload &&
+      'command' in payload;
   }
 
-  /** Occasionally nudge the simulation toward a mini "incident" so the
-   *  dashboard has something interesting to react to, then recover. */
-  function maybeSpike() {
-    if (Math.random() < 0.015) {
-      state.smoke = clamp(state.smoke + 180 + Math.random() * 150, 0, 900);
-      state.heat = clamp(state.heat + 8 + Math.random() * 10, 0, 120);
-      state.flameChance = 0.35;
-    } else {
-      state.flameChance = Math.max(0.02, state.flameChance * 0.6);
-    }
+  function fetchWithTimeout(url, timeoutMs) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+    return fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal
+    }).finally(function () {
+      clearTimeout(timer);
+    });
   }
 
-  function nextReading() {
-    maybeSpike();
-
-    // Smoke and heat drift, but pull back toward baseline when spray is on.
-    var smokeStep = overrideState.spray ? 12 : 18;
-    var heatStep = overrideState.spray ? 0.6 : 0.9;
-
-    state.smoke = randomWalk(state.smoke, smokeStep, 0, 900);
-    state.heat = randomWalk(state.heat, heatStep, 18, 120);
-
-    if (overrideState.spray) {
-      state.smoke = clamp(state.smoke - 25, 0, 900);
-      state.heat = clamp(state.heat - 0.8, 18, 120);
+  /**
+   * Begin polling {serverUrl}/api/data every ~2.5s.
+   *
+   * On each successful response, dispatches 'extingo:data' with the
+   * parsed payload and resets the retry backoff. On any failure
+   * (network error, non-2xx status, timeout, or a response that
+   * doesn't match the expected shape), dispatches 'extingo:offline'
+   * and retries after an exponentially increasing delay, capped at
+   * MAX_BACKOFF_MS.
+   *
+   * @param {string} serverUrl - base URL of the backend, e.g. "https://panel.local:8080"
+   * @returns {{ stop: function(): void }} handle to cancel polling
+   */
+  function startPolling(serverUrl) {
+    if (!serverUrl) {
+      throw new Error('startPolling(serverUrl) requires a server URL');
     }
 
-    if (!overrideState.mcb) {
-      // Pump/exhaust cannot run without the MCB energized.
-      overrideState.spray = false;
+    var endpoint = serverUrl.replace(/\/+$/, '') + '/api/data';
+    var stopped = false;
+    var failureCount = 0;
+    var timeoutHandle = null;
+
+    function nextBackoffDelay() {
+      var delay = BASE_INTERVAL_MS * Math.pow(2, failureCount);
+      return Math.min(delay, MAX_BACKOFF_MS);
     }
 
-    var flame = Math.random() < state.flameChance;
-    var motion = Math.random() < state.motionChance;
+    function scheduleNext(delayMs) {
+      if (stopped) return;
+      timeoutHandle = setTimeout(poll, delayMs);
+    }
+
+    function poll() {
+      if (stopped) return;
+
+      fetchWithTimeout(endpoint, REQUEST_TIMEOUT_MS)
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error('Request failed with status ' + response.status);
+          }
+          return response.json();
+        })
+        .then(function (payload) {
+          if (!isValidPayload(payload)) {
+            throw new Error('Response did not match the {telemetry, alert, status, command} shape');
+          }
+          failureCount = 0;
+          dispatch('extingo:data', payload);
+          scheduleNext(BASE_INTERVAL_MS);
+        })
+        .catch(function (err) {
+          var delay = nextBackoffDelay();
+          failureCount += 1;
+          dispatch('extingo:offline', {
+            error: err && err.message ? err.message : String(err),
+            attempt: failureCount,
+            nextRetryMs: delay
+          });
+          scheduleNext(delay);
+        });
+    }
+
+    poll();
 
     return {
-      timestamp: Date.now(),
-      flame: flame,
-      smoke: Math.round(state.smoke),
-      heat: Math.round(state.heat * 10) / 10,
-      motion: motion,
-      pump: overrideState.spray,
-      mcb: overrideState.mcb
+      stop: function stop() {
+        stopped = true;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
     };
   }
 
-  /** Derive NORMAL / EMERGENCY plus a human-readable reason. */
-  function getStatus(reading) {
-    var reasons = [];
-    if (reading.flame) reasons.push('flame detected');
-    if (reading.smoke >= THRESHOLDS.smokeAlert) reasons.push('smoke above alert threshold');
-    if (reading.heat >= THRESHOLDS.heatAlert) reasons.push('heat above alert threshold');
-
-    if (reasons.length) {
-      return { level: 'EMERGENCY', reasons: reasons };
-    }
-
-    var watchReasons = [];
-    if (reading.smoke >= THRESHOLDS.smokeWarn) watchReasons.push('smoke elevated');
-    if (reading.heat >= THRESHOLDS.heatWarn) watchReasons.push('heat elevated');
-
-    return { level: 'NORMAL', reasons: watchReasons };
-  }
-
-  function subscribe(callback) {
-    listeners.push(callback);
-    if (!timer) {
-      timer = setInterval(function () {
-        var reading = nextReading();
-        listeners.forEach(function (fn) { fn(reading); });
-      }, POLL_INTERVAL_MS);
-      // Emit one reading immediately so the UI isn't empty on load.
-      var first = nextReading();
-      setTimeout(function () {
-        listeners.forEach(function (fn) { fn(first); });
-      }, 50);
-    }
-    return function unsubscribe() {
-      listeners = listeners.filter(function (fn) { return fn !== callback; });
-    };
-  }
-
-  function setSpray(on) {
-    if (!overrideState.mcb && on) return overrideState; // guarded: needs power
-    overrideState.spray = !!on;
-    return overrideState;
-  }
-
-  function setMCB(on) {
-    overrideState.mcb = !!on;
-    if (!overrideState.mcb) overrideState.spray = false;
-    return overrideState;
-  }
-
-  function getOverrideState() {
-    return { spray: overrideState.spray, mcb: overrideState.mcb };
-  }
-
-  global.ExtingoAPI = {
-    THRESHOLDS: THRESHOLDS,
-    subscribe: subscribe,
-    getStatus: getStatus,
-    setSpray: setSpray,
-    setMCB: setMCB,
-    getOverrideState: getOverrideState
-  };
+  global.ExtingoAPI = global.ExtingoAPI || {};
+  global.ExtingoAPI.startPolling = startPolling;
 
 })(window);
