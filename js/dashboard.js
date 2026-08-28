@@ -20,6 +20,20 @@
  * If Site B's backend uses different field names, adjust the small
  * set of `data.telemetry.*` / `data.alert.*` / `data.command.*`
  * reads below — everything else (charts, gauge, log) is unaffected.
+ *
+ * --- Resilience note ---
+ * initCharts() used to be called directly in the DOMContentLoaded
+ * handler with nothing to catch a thrown error. If the Chart.js CDN
+ * script ever failed to load (blocked by an ad blocker, offline CDN,
+ * bad network, etc.), `Chart` was undefined, initCharts() threw, and
+ * — because JS errors abort the rest of a synchronous function —
+ * every line after it (log setup, override panel wiring, the clock,
+ * and ExtingoAPI.startPolling itself) silently never ran. The whole
+ * panel looked dead with no obvious cause. initCharts() now fails
+ * loudly into the action log instead of taking the rest of boot down
+ * with it, and updateCharts() no-ops safely if charts were never
+ * created. For a production panel, consider self-hosting Chart.js
+ * under assets/js/ instead of depending on any external CDN.
  */
 (function () {
   'use strict';
@@ -281,14 +295,24 @@
     };
   }
 
+  /* Throws if Chart.js never loaded (e.g. blocked script) — the
+     caller in the boot sequence catches this so a missing chart
+     library degrades gracefully instead of halting everything. */
   function initCharts() {
+    if (typeof Chart === 'undefined') {
+      throw new Error('Chart.js failed to load — charts will be unavailable');
+    }
     var smokeCtx = $('smoke-chart').getContext('2d');
     var heatCtx = $('heat-chart').getContext('2d');
     charts.smoke = new Chart(smokeCtx, buildChartConfig('Smoke (ppm)', '#f39c12'));
     charts.heat = new Chart(heatCtx, buildChartConfig('Heat (°C)', '#e74c3c'));
   }
 
+  /* Safe no-op if charts were never created (Chart.js missing/blocked)
+     so the rest of the data pipeline (tiles, gauge, log) keeps working. */
   function updateCharts() {
+    if (!charts.smoke || !charts.heat) return;
+
     charts.smoke.data.labels = ExtingoHistory.getLabels('smoke');
     charts.smoke.data.datasets[0].data = ExtingoHistory.getValues('smoke');
     charts.smoke.update('none');
@@ -497,11 +521,21 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     cacheElements();
-    initCharts();
-    setupLogToggle();
-    setupOverridePanel();
 
+    // Wired first so initCharts() failures below still have somewhere
+    // to report to, and so a chart problem can't block log/override
+    // setup or the live data feed from starting.
+    setupLogToggle();
     addLogEntry('Control center initialized', 'info');
+
+    try {
+      initCharts();
+    } catch (err) {
+      addLogEntry('Chart rendering unavailable: ' + err.message, 'alert');
+      // charts.smoke / charts.heat stay null; updateCharts() no-ops safely.
+    }
+
+    setupOverridePanel();
 
     window.addEventListener('extingo:data', handleData);
     window.addEventListener('extingo:offline', handleOffline);
