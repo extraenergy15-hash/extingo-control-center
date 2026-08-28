@@ -52,7 +52,7 @@
 
       <article class="sensor-tile" data-sensor="flame">
         <header class="tile-head">
-          <img class="tile-icon" src="assets/icons/flame.jpg" alt="" aria-hidden="true">
+          <img class="tile-icon" src="assets/icons/flame.svg" alt="" aria-hidden="true">
           <h3 class="tile-title">Flame</h3>
           <span class="tile-tag">IR</span>
         </header>
@@ -67,7 +67,7 @@
 
       <article class="sensor-tile" data-sensor="smoke">
         <header class="tile-head">
-          <img class="tile-icon" src="assets/icons/smoke.jpg" alt="" aria-hidden="true">
+          <img class="tile-icon" src="assets/icons/smoke.svg" alt="" aria-hidden="true">
           <h3 class="tile-title">Smoke</h3>
           <span class="tile-tag">MQ2</span>
         </header>
@@ -83,7 +83,7 @@
 
       <article class="sensor-tile" data-sensor="heat">
         <header class="tile-head">
-          <img class="tile-icon" src="assets/icons/heat.jpg" alt="" aria-hidden="true">
+          <img class="tile-icon" src="assets/icons/heat.svg" alt="" aria-hidden="true">
           <h3 class="tile-title">Heat</h3>
           <span class="tile-tag">DHT22</span>
         </header>
@@ -99,7 +99,7 @@
 
       <article class="sensor-tile" data-sensor="motion">
         <header class="tile-head">
-          <img class="tile-icon" src="assets/icons/motion.jpg" alt="" aria-hidden="true">
+          <img class="tile-icon" src="assets/icons/motion.svg" alt="" aria-hidden="true">
           <h3 class="tile-title">Motion</h3>
           <span class="tile-tag">PIR</span>
         </header>
@@ -114,7 +114,7 @@
 
       <article class="sensor-tile" data-sensor="pump">
         <header class="tile-head">
-          <img class="tile-icon" src="assets/icons/pump.jpg" alt="" aria-hidden="true">
+          <img class="tile-icon" src="assets/icons/pump.svg" alt="" aria-hidden="true">
           <h3 class="tile-title">Pump / Exhaust</h3>
           <span class="tile-tag">RELAY</span>
         </header>
@@ -241,7 +241,17 @@
     <span>Extingo Control Center — simulated sensor feed for demonstration</span>
   </footer>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+  <!--
+    Chart.js was previously loaded from cdnjs.cloudflare.com, then from
+    jsdelivr — both got blocked client-side (net::ERR_BLOCKED_BY_CLIENT),
+    which left `Chart` undefined and crashed the whole boot sequence in
+    dashboard.js. Since two unrelated CDN domains were both blocked, this
+    is a filename/pattern block on the client (extension, browser shield,
+    or network filter), not a bad URL. Self-hosting it same-origin under
+    assets/js/ sidesteps that entirely — third-party-script blockers don't
+    touch same-origin requests.
+  -->
+  <script src="assets/js/chart.umd.js"></script>
   <script src="js/api.js"></script>
   <script src="js/dashboard.js"></script>
   <script src="js/history.js"></script>
